@@ -46,34 +46,67 @@ if [ -d "$home_dir" ] && [ -n "$(find "$home_dir" \( ! -user node -o ! -group no
 fi
 
 # --- Fork-local: disk-exhaustion prevention (Railway volume is fixed-size) ---
-# Retained across the 2026-08 upstream sync. Upstream has no equivalent, and
-# this container previously filled its volume and hit ENOSPC. The Paperclip
-# backup-retention routines that would otherwise cover this are PAUSED under
-# the cost hold, so this entrypoint is the only active disk protection.
+# This container filled its 4.4GB volume and hit ENOSPC (gzip died mid-backup,
+# 2026-06-06). Upstream's own backup retention now covers instances/*/data/
+# backups, so this block deliberately targets only what upstream does NOT:
+# caches and logs living in the node user's HOME (which IS the volume root).
+#
+# Rewritten 2026-08-18 after an audit found the previous version was a no-op:
+# it globbed instances/*/agents/*/.claude, but agent dirs actually live at
+# instances/*/companies/<companyId>/agents/<agentId>/, and the caches that
+# actually filled the disk (.npm at 1.9GB, .claude at 179MB) are in $HOME.
 # Runs as root, before dropping privileges, so it can remove node-owned files.
 
-# Prune run logs older than 7 days, for every instance
-for instance_dir in "$home_dir"/instances/*; do
-    RUN_LOG_DIR="${instance_dir}/data/run-logs"
-    if [ -d "$RUN_LOG_DIR" ]; then
-        echo "Cleaning logs in $RUN_LOG_DIR"
-        find "$RUN_LOG_DIR" -type f -mtime +7 -delete 2>/dev/null || true
+prune_report() {  # $1 = path, $2 = label
+    [ -e "$1" ] && echo "  pruned $2 ($(du -sm "$1" 2>/dev/null | cut -f1)MB)"
+}
+
+# 1) npm cache — the single biggest offender (1.9GB when the volume filled).
+#    Safe to delete outright; npm rebuilds it on demand.
+if [ -d "$home_dir/.npm" ]; then
+    NPM_MB=$(du -sm "$home_dir/.npm" 2>/dev/null | cut -f1)
+    if [ "${NPM_MB:-0}" -gt 500 ]; then
+        prune_report "$home_dir/.npm" "npm cache"
+        rm -rf "$home_dir/.npm/_cacache" 2>/dev/null || true
+    fi
+fi
+
+# 2) Claude Code session transcripts older than 7 days. These are history, not
+#    state; settings.json / backups / sessions are left untouched.
+if [ -d "$home_dir/.claude/projects" ]; then
+    find "$home_dir/.claude/projects" -type f -mtime +7 -delete 2>/dev/null || true
+    find "$home_dir/.claude/projects" -type d -empty -delete 2>/dev/null || true
+fi
+[ -d "$home_dir/.claude/cache" ] && rm -rf "$home_dir/.claude/cache" 2>/dev/null || true
+
+# 3) Per-agent Claude caches, at the path they actually occupy.
+for AGENT_DIR in "$home_dir"/instances/*/companies/*/agents/*/; do
+    [ -d "${AGENT_DIR}.claude/cache" ] || continue
+    CACHE_MB=$(du -sm "${AGENT_DIR}.claude" 2>/dev/null | cut -f1)
+    if [ "${CACHE_MB:-0}" -gt 50 ]; then
+        echo "  pruned agent .claude cache (${CACHE_MB}MB) in $AGENT_DIR"
+        rm -rf "${AGENT_DIR}.claude/cache" 2>/dev/null || true
     fi
 done
 
-# Prune oversized Claude Code caches (>50MB) that accumulate per agent
-for AGENT_DIR in "$home_dir"/instances/*/agents/*/; do
-    if [ -d "${AGENT_DIR}.claude" ]; then
-        CACHE_SIZE=$(du -sm "${AGENT_DIR}.claude" 2>/dev/null | cut -f1)
-        if [ "${CACHE_SIZE:-0}" -gt 50 ]; then
-            echo "Pruning large .claude cache (${CACHE_SIZE}MB) in $AGENT_DIR"
-            rm -rf "${AGENT_DIR}.claude/cache" 2>/dev/null || true
-        fi
+# 4) Run logs older than 7 days.
+for instance_dir in "$home_dir"/instances/*; do
+    RUN_LOG_DIR="${instance_dir}/data/run-logs"
+    [ -d "$RUN_LOG_DIR" ] && find "$RUN_LOG_DIR" -type f -mtime +7 -delete 2>/dev/null || true
+done
+
+# 5) server.log grows unbounded with nothing rotating it (87MB when full).
+for SRV_LOG in "$home_dir"/instances/*/logs/server.log; do
+    [ -f "$SRV_LOG" ] || continue
+    if [ "$(wc -c < "$SRV_LOG" 2>/dev/null || echo 0)" -gt 52428800 ]; then
+        echo "  truncated $SRV_LOG"
+        : > "$SRV_LOG"
     fi
 done
 
 USED=$(du -sm "$home_dir" 2>/dev/null | cut -f1)
-echo "Volume $home_dir usage: ${USED}MB"
+AVAIL=$(df -Pm "$home_dir" 2>/dev/null | awk 'NR==2{print $4}')
+echo "Volume $home_dir usage: ${USED}MB (${AVAIL:-?}MB free)"
 
 # --- Fork-local: cortex-brains reconcile loop (replaces the dead cron) ---
 # The image ships no cron daemon, so the 60s brains sync has no runner: agent
