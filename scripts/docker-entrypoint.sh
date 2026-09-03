@@ -125,6 +125,11 @@ if [ -x "$RECONCILE_SH" ]; then
     mkdir -p "$BRAINS_DIR/.cron-logs" 2>/dev/null || true
     chown node:node "$BRAINS_DIR/.cron-logs" 2>/dev/null || true
     (
+        # Make git itself abandon a stalled transfer instead of hanging forever:
+        # abort if throughput stays under 1KB/s for 30s. The outer timeout is the
+        # backstop; these make the common case fail fast and cleanly.
+        export GIT_HTTP_LOW_SPEED_LIMIT=1024
+        export GIT_HTTP_LOW_SPEED_TIME=30
         while true; do
             sleep 60
             # Keep the log bounded — nothing else rotates it.
@@ -132,7 +137,14 @@ if [ -x "$RECONCILE_SH" ]; then
                [ "$(wc -c < "$RECONCILE_LOG" 2>/dev/null || echo 0)" -gt 5242880 ]; then
                 : > "$RECONCILE_LOG"
             fi
-            gosu node "$RECONCILE_SH" "$BRAINS_DIR" >> "$RECONCILE_LOG" 2>&1 || true
+            # Hard wall-clock cap. Without it a git fetch/push that stalls on the
+            # network never returns, the loop blocks forever on that one child,
+            # every later child is left unreaped, and the container eventually
+            # cannot fork at all. That happened in production: 924 zombie git
+            # processes and 44k threads by 2026-09-03, which broke agent spawn
+            # fleet-wide. SIGTERM at 120s, SIGKILL 30s later if it ignores that.
+            timeout -k 30 120 gosu node "$RECONCILE_SH" "$BRAINS_DIR" \
+                >> "$RECONCILE_LOG" 2>&1 || true
         done
     ) &
     echo "docker-entrypoint.sh: cortex-brains reconcile loop started (every 60s)"
