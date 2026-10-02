@@ -84,6 +84,14 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
 
+# PDF text for the agents (Echo Barrier, 2 October 2026): pdftotext (poppler-utils) and pypdf. The
+# agents read standards, environmental impact statements and guide specifications as PDFs; without
+# these they pip-installed pypdf into their scratch directory mid-run, or reported a PDF "not read".
+# Its own layer, after the CLI tools, so adding it does not invalidate that layer's cache.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends poppler-utils python3-pypdf \
+  && rm -rf /var/lib/apt/lists/*
+
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
